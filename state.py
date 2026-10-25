@@ -23,11 +23,14 @@ class StateManager:
         self.report_parts: dict[int, str] = {}
         self.failed_part_ids: list[int] = []
 
+    def _file_stem(self) -> str:
+        """Base name shared by checkpoint and report files, e.g. FIG."""
+        return self.target.ticker or self.target.raw_input.replace(" ", "_")
+
     def _checkpoint_path(self) -> Path:
         """Return the checkpoint file path for the current target."""
-        name = self.target.ticker or self.target.raw_input.replace(" ", "_")
         today = date.today().isoformat()
-        return DATA_DIR / f"checkpoint_{name}_{today}.json"
+        return DATA_DIR / f"checkpoint_{self._file_stem()}_{today}.json"
 
     def save_checkpoint(self, completed_part_ids: list[int]):
         """Save current progress to a checkpoint file."""
@@ -47,6 +50,16 @@ class StateManager:
         path = self._checkpoint_path()
         path.write_text(json.dumps(cp, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"Checkpoint saved: {path.name} (Parts {completed_part_ids})", "done")
+        self.html_path = self.build_html()
+
+    def build_html(self, report_path: Path | None = None) -> Path | None:
+        """Refresh the browser view of this run from the checkpoint."""
+        try:
+            from viewer import build_html
+            return build_html(self._checkpoint_path(), report_path)
+        except Exception as e:
+            log(f"HTML view not updated: {e}", "warn")
+            return None
 
     def load_checkpoint(self, resume: bool) -> list[int]:
         """Try to restore from checkpoint. Returns list of completed part IDs."""
@@ -126,9 +139,8 @@ class StateManager:
     def save_report(self, report: str) -> Path:
         """Save report as markdown file."""
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-        name = self.target.ticker or self.target.raw_input.replace(" ", "_")
         today = date.today().isoformat()
-        filename = f"{name}_{today}.md"
+        filename = f"{self._file_stem()}_{today}.md"
         path = REPORTS_DIR / filename
         path.write_text(report, encoding="utf-8")
         return path

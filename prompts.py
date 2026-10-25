@@ -3,6 +3,18 @@
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
+# Date anchor (appended to every target description)
+# ---------------------------------------------------------------------------
+# Models' training knowledge is older than the research date; without this they
+# may override fresh tool data with stale memory (e.g. "Figma is not listed").
+
+DATE_ANCHOR = (
+    "Research date (today): {today}. 你的训练知识可能早于这个日期，"
+    "公司状态（是否上市、财务数据、管理层、股价等）一律以工具返回的数据为准，"
+    "不得用记忆中的旧信息推翻或替代工具数据。"
+)
+
+# ---------------------------------------------------------------------------
 # System prompt for research phase (Phase 1)
 # ---------------------------------------------------------------------------
 
@@ -27,7 +39,13 @@ Focus your tool calls on gathering data relevant to this specific part.
 1. Call tools to gather real data. Never fabricate data.
 2. Use web_search for news, analyst opinions, industry data.
 3. Use get_stock_info and get_financials for listed companies.
-4. Use get_sec_filings + read_url for SEC filings (US companies).
+4. US-listed companies: call get_sec_financial_data FIRST — it is the authoritative, as-filed \
+source for revenue, profit, cash flow and balance-sheet figures. get_sec_filings lists the \
+key filings (10-K, 10-Qs, earnings press releases, management changes); read them with \
+read_url (with `find`, e.g. "Results of Operations", "Key Business Metrics", "Liquidity") for \
+segment data, KPIs and management's explanations. Use get_insider_trading for holding changes \
+of directors, officers and major holders. When sources disagree, the SEC filing wins over \
+yfinance, which wins over media/aggregator websites.
 5. Use read_url to read any webpage with useful information.
 6. Use read_local_file to read previous reports in reports/ folder.
 7. Search in both English and Chinese when relevant.
@@ -40,7 +58,10 @@ STRICTLY on the data successfully returned by your tools.
 9. When you have collected sufficient data for this part, respond with a text \
 summary of all findings (DO NOT call any more tools). Start your summary with \
 "RESEARCH COMPLETE:" to signal you are done.
-10. Aim for 3-8 tool calls per part. Be efficient but thorough.
+10. Accuracy matters more than speed or cost. Typically use 10-30 tool calls per part. \
+Verify every key number (revenue, margins, growth, valuation multiples) against a primary \
+source, and use the most recent reporting period available. Record the period and source \
+of each number you collect.
 11. [TARGET LOCK] 你正在研究的标的是：{target_description}。\
 所有 tool call 和分析必须围绕这个标的进行。\
 如果工具返回了其他公司的数据，你必须识别并忽略无关数据。\
@@ -66,10 +87,10 @@ EXTRACTION_PROMPT = """\
 
 要求：
 1. 保留所有具体数字、百分比、日期
-2. 保留数据来源
+2. 保留数据来源，并标注来源等级：[SEC申报] > [yfinance] > [媒体/网站]。同一指标多个来源时，以等级高者为准
 3. 去除重复信息
 4. 用中文输出
-5. 控制在 2000 字以内
+5. 篇幅不设硬性上限（通常 3000–8000 字）。这是撰写章节的唯一数据来源，宁可完整保留关键数字及其期间、来源，也不要过度压缩
 6. [矛盾标记] 如果多源数据存在相互冲突（如营收数字不一致），用 ⚠️ 明确标记，并说明哪个来源更权威
 7. [数据规范] 所有财务数据必须带上货币单位、时间跨度（TTM/年度/季度）、以及（实际值/预测值）标签
 8. [利润率分解] 如果涉及利润率变化，提取时尽量拆解它是由（a）原材料价格波动，还是（b）经营效率提升/定价权带来的
@@ -116,6 +137,12 @@ REPORT_WRITING_PROMPT = """\
 18. [涨跌归因] 复盘股价时，将每次大级别波动明确归因为：(a) 基本面 (b) 筹码/资金面 (c) 情绪面 (d) 宏观因素。说明其中多少是受基本面影响。
 19. [估值陷阱] 在估值部分，除了常规指标外，尝试列出该公司特有的"估值陷阱"（如：商品周期带来的高利润错觉、低流通盘导致的估值失真）。
 20. [数据缺失处理] 如果公开数据严重不足（如公司刚上市或部分业务未披露），明确声明这种数据限制，不加主观臆想。
+21. [拒绝空话] 每一个判断都必须紧跟支撑它的具体数字（含期间与来源）。没有数据支撑的判断不要写。\
+禁止"前景广阔""竞争激烈""值得关注""有望受益"这类无法验证的套话；改写成可验证的表述，\
+例如"2026 年 Q2 营收 3.70 亿美元，同比 +48%（SEC 10-Q）"。
+22. [最新数据优先] 以结构化数据中最新的报告期为分析基准，并写明该期间（如"截至 2026-06-30 的季度"）。\
+不要把年度数据称为 TTM，不要用过期数据当作"当前"。
+23. [结论可证伪] 本章结尾给出 2–3 条结论，每条都要能被未来某个具体数据证实或推翻（写明是哪个指标、什么阈值）。
 """
 
 # ---------------------------------------------------------------------------
@@ -157,11 +184,38 @@ EXECUTIVE_SUMMARY_PROMPT = """\
 2. **核心投资论点 (Bull Thesis)**：支撑做多逻辑的核心竞争优势和增长动力是什么。
 3. **关键反方风险 (Bear Thesis)**：打破该投资逻辑的最核心风险或最致命的证伪条件是什么。
 4. **关键数据追踪**：用两三句话总结最关键的财务里程碑和当前估值状态。
-5. **[关键纠偏 (Critical Correction)]**：如果该公司的名称、注册地或上市交易所极易让人对它的【核心收入来源地】产生误读（例如名字带有中国地域但主要业务在非洲），你必须在摘要最开头用粗体写出"**关键纠偏：...**"。如果没有这种风险，则跳过此项。
+
+不要写收入地区的纠偏说明（这一项由单独的步骤判断并添加）。
 
 输出要求直接开始正文，一段到底或使用精炼的几条 bullet points，绝对不要任何"好的，这里是您的执行摘要"等废话。
 
 ## 完整报告内容：
+{full_report}
+"""
+
+# ---------------------------------------------------------------------------
+# Critical-correction check (decided separately from the summary)
+# ---------------------------------------------------------------------------
+# As a slot inside the summary template the model filled it for every company
+# (e.g. a "not China-related" note for Figma). A standalone yes/no question
+# with explicit criteria is answered reliably.
+
+GEO_CORRECTION_PROMPT = """\
+下面是一份公司研究报告。请只回答一个问题：这家公司是否需要在报告开头加一条"收入地区纠偏"提醒？
+
+只有同时满足以下两点才回答需要：
+(a) 报告数据显示公司最大的单一收入国家或单一大洲，与其名称、注册地或上市地所暗示的国家/地区明显不同。\
+"国际""美国以外""海外"等多国合计口径不算一个地区，不能用来比较。
+(b) 普通读者仅凭名称或上市地，就很可能误判其收入来源。
+
+例：中文名、香港上市、但约 98% 收入来自撒哈拉以南非洲的公司 → 需要。
+例：总部和上市地都在美国、美国是最大单一市场的公司（即使海外合计过半）→ 不需要。
+绝大多数公司都不需要；无法确定时回答不需要。
+
+只输出 JSON，不要任何其他文字：
+{{"needed": true 或 false, "correction": "需要时，一句话说明实际的核心收入地区、占比及数据出处；不需要时为空字符串"}}
+
+## 报告内容：
 {full_report}
 """
 

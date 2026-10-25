@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import date
 
 from router import ModelRouter
 from router_config import ENABLE_PREFLIGHT_CHECK
@@ -18,13 +19,16 @@ from config import (
     MAX_TOOL_CALLS_PER_PART,
     MODES_DIR,
     RESEARCH_MAX_TOKENS,
+    SUMMARY_MAX_TOKENS,
     TOOL_RESULT_LLM_CHARS,
     TOOL_RESULT_RAW_CHARS,
     WRITING_MAX_TOKENS,
 )
 from prompts import (
+    DATE_ANCHOR,
     EXTRACTION_PROMPT,
     FINAL_JUDGMENT_PROMPT,
+    GEO_CORRECTION_PROMPT,
     PARTS,
     REPORT_WRITING_PROMPT,
     RESEARCH_SYSTEM_PROMPT,
@@ -34,6 +38,7 @@ from schemas import PartResearch, ResearchTarget, Signal
 from state import StateManager
 from tools import TOOL_DEFINITIONS, execute_tool
 from utils import format_tool_results_message, log, serialize_assistant_message
+from viewer import open_in_browser
 
 
 class ResearchAgent:
@@ -68,6 +73,7 @@ class ResearchAgent:
             parts.append(f"Company: {self.target.company_name}")
         if not self.target.is_listed:
             parts.append("Note: This may be an unlisted company. Use web_search as primary data source.")
+        parts.append(DATE_ANCHOR.format(today=date.today().isoformat()))
         return "\n".join(parts)
 
     def _research_part(self, part_id: int, part_title: str, part_desc: str) -> PartResearch:
@@ -161,10 +167,16 @@ class ResearchAgent:
 
     def _extract_data(self, part: PartResearch) -> str:
         log(f"Extracting data for Part {part.part_id}...")
+        raw = part.raw_data
+        if len(raw) > EXTRACTION_RAW_CHARS:
+            # Keep the research model's closing summary, which is the last chunk
+            tail = raw.rsplit("\n\n---\n\n", 1)[-1][-10000:]
+            raw = raw[:EXTRACTION_RAW_CHARS - len(tail) - 20] + "\n\n…(truncated)…\n\n" + tail
+            log(f"  Part {part.part_id} raw data truncated for extraction ({len(part.raw_data):,} chars)", "warn")
         prompt = EXTRACTION_PROMPT.format(
             target_description=self._target_description(),
             part_title=part.part_title,
-            raw_data=part.raw_data[:EXTRACTION_RAW_CHARS],
+            raw_data=raw,
         )
         response = self.router.route_raw(model_tier="low", messages=[{"role": "user", "content": prompt}], max_tokens=EXTRACTION_MAX_TOKENS)
         self.manager.state.total_input_tokens += response.input_tokens
@@ -188,7 +200,8 @@ class ResearchAgent:
     def _final_judgment(self, full_report: str) -> tuple[str, Signal | None, float | None]:
         log("Generating final investment judgment...", "info")
         company = self.target.company_name or self.target.raw_input
-        prompt = FINAL_JUDGMENT_PROMPT.format(company=company, full_report=full_report[:JUDGMENT_REPORT_CHARS])
+        prompt = (DATE_ANCHOR.format(today=date.today().isoformat()) + "\n\n"
+                  + FINAL_JUDGMENT_PROMPT.format(company=company, full_report=full_report[:JUDGMENT_REPORT_CHARS]))
         response = self.router.route_raw(model_tier="high", messages=[{"role": "user", "content": prompt}], max_tokens=JUDGMENT_MAX_TOKENS)
         self.manager.state.total_input_tokens += response.input_tokens
         self.manager.state.total_output_tokens += response.output_tokens
@@ -200,11 +213,28 @@ class ResearchAgent:
     def _write_executive_summary(self, full_report: str) -> str:
         log("Generating executive summary...", "info")
         prompt = EXECUTIVE_SUMMARY_PROMPT.format(full_report=full_report[:JUDGMENT_REPORT_CHARS])
-        response = self.router.route_raw(model_tier="high", messages=[{"role": "user", "content": prompt}], max_tokens=1000)
+        response = self.router.route_raw(model_tier="summary", messages=[{"role": "user", "content": prompt}], max_tokens=SUMMARY_MAX_TOKENS)
         self.manager.state.total_input_tokens += response.input_tokens
         self.manager.state.total_output_tokens += response.output_tokens
         self._record_model(response)
-        return response.content
+        correction = self._geo_correction(full_report)
+        return f"**关键纠偏：{correction}**\n\n{response.content}" if correction else response.content
+
+    def _geo_correction(self, full_report: str) -> str:
+        """Revenue-geography warning for the summary, or "" when none is needed."""
+        prompt = GEO_CORRECTION_PROMPT.format(full_report=full_report[:JUDGMENT_REPORT_CHARS])
+        response = self.router.route_raw(model_tier="high", messages=[{"role": "user", "content": prompt}], max_tokens=JUDGMENT_MAX_TOKENS)
+        self.manager.state.total_input_tokens += response.input_tokens
+        self.manager.state.total_output_tokens += response.output_tokens
+        self._record_model(response)
+        match = re.search(r"\{.*\}", response.content, re.S)
+        try:
+            result = json.loads(match.group(0)) if match else {}
+        except json.JSONDecodeError:
+            result = {}
+        if result.get("needed") is True and result.get("correction"):
+            return str(result["correction"]).strip().removeprefix("关键纠偏：")
+        return ""
         
     def _parse_signal(self, text: str) -> tuple[Signal | None, float | None]:
         signal = None
@@ -267,10 +297,13 @@ class ResearchAgent:
                 self.manager.save_checkpoint(completed_part_ids)
                 log(f"Preview Part {preview_part[0]} done. Tokens: {self.manager.state.total_input_tokens:,} in / {self.manager.state.total_output_tokens:,} out", "done")
                 
-                print(f"\n--- PREVIEW: {preview_part[1]} ---")
-                print(self.manager.report_parts[preview_part[0]])
-                print("-----------------------------------\n")
-                
+                html_path = getattr(self.manager, "html_path", None)
+                if html_path:
+                    open_in_browser(html_path)
+                    log(f"Preview ready — opened in browser: {html_path}", "done")
+                else:
+                    print(self.manager.report_parts[preview_part[0]])
+
                 user_ok = input("Preview completed. Does this look OK? Continue with full research? [y/N]: ").strip().lower()
                 if user_ok not in ['y', 'yes']:
                     log("User aborted after preview.", "warn")
@@ -335,4 +368,8 @@ class ResearchAgent:
         
         log(f"Research complete! Time: {time.time() - start_time:.0f}s | Cost: ~${self.manager.estimate_cost():.2f}", "done")
         log(f"Report saved: {report_path}", "done")
+        html_path = self.manager.build_html(report_path)
+        if html_path:
+            open_in_browser(html_path)
+            log(f"HTML report: {html_path}", "done")
         return str(report_path)

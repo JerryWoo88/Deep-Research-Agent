@@ -17,6 +17,7 @@ from router_config import (
     CLASSIFY_MAX_TOKENS,
     CLASSIFY_MODEL,
     CLASSIFY_PROMPT,
+    EMPTY_REPLY_ATTEMPTS,
     MODEL_MAP,
     TIER_LABELS,
 )
@@ -205,6 +206,7 @@ class ModelRouter:
         """Send a full messages list (with optional tools) to a specific model tier."""
         model_override = kwargs.pop("model_override", None)
         
+        model_info: dict = {}
         if model_override:
             model_name = model_override
             provider = "openai" # Gemini always uses openai-compat via native gateway for fallback
@@ -270,11 +272,30 @@ class ModelRouter:
                 }
                 if tools:
                     create_params["tools"] = self._convert_tools_to_openai(tools)
+                if model_info.get("extra_body"):
+                    create_params["extra_body"] = model_info["extra_body"]
 
                 client = self.gemini_client if "gemini" in model_name.lower() else self.openai_client
-                raw_resp = client.chat.completions.create(**create_params)
-                choice = raw_resp.choices[0]
-                msg = choice.message
+                # Never pass an empty answer downstream as a real one. Two causes seen:
+                # a thinking model spending the whole budget on reasoning
+                # (finish_reason "length"), and occasional empty replies with
+                # finish_reason "stop" (CRCL's final judgment came back as 0 chars;
+                # the identical call then succeeded twice). Retry, then fail loudly.
+                for attempt in range(1, EMPTY_REPLY_ATTEMPTS + 1):
+                    raw_resp = client.chat.completions.create(**create_params)
+                    choice = raw_resp.choices[0]
+                    msg = choice.message
+                    if (msg.content or "").strip() or msg.tool_calls:
+                        break
+                    print(f"⚠️  [Router] {model_name} returned an empty answer "
+                          f"(finish_reason={choice.finish_reason}, tier={model_tier}), attempt {attempt}/{EMPTY_REPLY_ATTEMPTS}")
+                else:
+                    hint = ("; raise the token limit or use a non-thinking model"
+                            if choice.finish_reason == "length" else "")
+                    raise RuntimeError(f"{model_name} returned an empty answer {EMPTY_REPLY_ATTEMPTS} times "
+                                       f"(tier={model_tier}, finish_reason={choice.finish_reason}){hint}")
+                if choice.finish_reason == "length":
+                    print(f"⚠️  [Router] {model_name} output was cut off at max_tokens ({max_tokens}), tier={model_tier}")
                 
                 tool_calls = []
                 if msg.tool_calls:
@@ -298,10 +319,10 @@ class ModelRouter:
         except (anthropic.AuthenticationError, openai.AuthenticationError) as e:
             from router_config import ENABLE_FALLBACK, FALLBACK_MODEL
             if ENABLE_FALLBACK and model_name != FALLBACK_MODEL["model"]:
-                print(f"⚠️  [Router] Aihubmix funds exhausted or auth error. Falling back to Gemini ({FALLBACK_MODEL['model']})...")
-                # Retry with fallback model (always using Gemini client/OpenAI protocol)
+                print(f"⚠️  [Router] Auth error on {model_name}. Falling back to {FALLBACK_MODEL['model']}...")
+                # Retry with fallback model; keep the original tier so metadata stays accurate
                 return self.route_raw(
-                    model_tier="low", # Force low tier characteristics or we can pass a custom model
+                    model_tier=model_tier,
                     messages=messages,
                     max_tokens=max_tokens,
                     system=system,
